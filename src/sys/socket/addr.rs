@@ -8,6 +8,8 @@ use std::path::Path;
 use std::os::unix::ffi::OsStrExt;
 #[cfg(any(target_os = "android", target_os = "linux"))]
 use ::sys::socket::addr::netlink::NetlinkAddr;
+#[cfg(any(target_os = "android", target_os = "linux"))]
+use ::sys::socket::addr::packet::PacketAddr;
 #[cfg(any(target_os = "ios", target_os = "macos"))]
 use std::os::unix::io::RawFd;
 #[cfg(any(target_os = "ios", target_os = "macos"))]
@@ -206,8 +208,8 @@ impl AddressFamily {
     /// Create a new `AddressFamily` from an integer value retrieved from `libc`, usually from
     /// the `sa_family` field of a `sockaddr`.
     ///
-    /// Currently only supports these address families: Unix, Inet (v4 & v6), Netlink
-    /// and System. Returns None for unsupported or unknown address families.
+    /// Currently only supports these address families: Unix, Inet (v4 & v6), Netlink,
+    /// Packet, System, and Link. Returns None for unsupported or unknown address families.
     pub fn from_i32(family: i32) -> Option<AddressFamily> {
         match family {
             libc::AF_UNIX => Some(AddressFamily::Unix),
@@ -215,6 +217,8 @@ impl AddressFamily {
             libc::AF_INET6 => Some(AddressFamily::Inet6),
             #[cfg(any(target_os = "android", target_os = "linux"))]
             libc::AF_NETLINK => Some(AddressFamily::Netlink),
+            #[cfg(any(target_os = "android", target_os = "linux"))]
+            libc::AF_PACKET => Some(AddressFamily::Packet),
             #[cfg(any(target_os = "macos", target_os = "macos"))]
             libc::AF_SYSTEM => Some(AddressFamily::System),
             _ => None
@@ -689,6 +693,8 @@ pub enum SockAddr {
     Unix(UnixAddr),
     #[cfg(any(target_os = "android", target_os = "linux"))]
     Netlink(NetlinkAddr),
+    #[cfg(any(target_os = "android", target_os = "linux"))]
+    Packet(PacketAddr),
     #[cfg(any(target_os = "ios", target_os = "macos"))]
     SysControl(SysControlAddr),
 }
@@ -719,6 +725,8 @@ impl SockAddr {
             SockAddr::Unix(..) => AddressFamily::Unix,
             #[cfg(any(target_os = "android", target_os = "linux"))]
             SockAddr::Netlink(..) => AddressFamily::Netlink,
+            #[cfg(any(target_os = "android", target_os = "linux"))]
+            SockAddr::Packet(..) => AddressFamily::Packet,
             #[cfg(any(target_os = "ios", target_os = "macos"))]
             SockAddr::SysControl(..) => AddressFamily::System,
         }
@@ -745,6 +753,9 @@ impl SockAddr {
                 #[cfg(any(target_os = "android", target_os = "linux"))]
                 Some(AddressFamily::Netlink) => Some(SockAddr::Netlink(
                     NetlinkAddr(*(addr as *const libc::sockaddr_nl)))),
+                #[cfg(any(target_os = "android", target_os = "linux"))]
+                Some(AddressFamily::Packet) => Some(SockAddr::Packet(
+                    PacketAddr(*(addr as *const libc::sockaddr_ll)))),
                 #[cfg(any(target_os = "ios", target_os = "macos"))]
                 Some(AddressFamily::System) => Some(SockAddr::SysControl(
                     SysControlAddr(*(addr as *const sys_control::sockaddr_ctl)))),
@@ -763,6 +774,10 @@ impl SockAddr {
             SockAddr::Unix(UnixAddr(ref addr, len)) => (mem::transmute(addr), (len + offset_of!(libc::sockaddr_un, sun_path)) as libc::socklen_t),
             #[cfg(any(target_os = "android", target_os = "linux"))]
             SockAddr::Netlink(NetlinkAddr(ref sa)) => (mem::transmute(sa), mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t),
+            #[cfg(any(target_os = "android", target_os = "linux"))]
+            SockAddr::Packet(PacketAddr(ref sa)) => (
+                mem::transmute(sa),
+                mem::size_of::<libc::sockaddr_ll>() as libc::socklen_t),
             #[cfg(any(target_os = "ios", target_os = "macos"))]
             SockAddr::SysControl(SysControlAddr(ref sa)) => (mem::transmute(sa), mem::size_of::<sys_control::sockaddr_ctl>() as libc::socklen_t),
         }
@@ -797,6 +812,8 @@ impl hash::Hash for SockAddr {
             SockAddr::Unix(ref a) => a.hash(s),
             #[cfg(any(target_os = "android", target_os = "linux"))]
             SockAddr::Netlink(ref a) => a.hash(s),
+            #[cfg(any(target_os = "android", target_os = "linux"))]
+            SockAddr::Packet(ref p) => p.hash(s),
             #[cfg(any(target_os = "ios", target_os = "macos"))]
             SockAddr::SysControl(ref a) => a.hash(s),
         }
@@ -816,6 +833,8 @@ impl fmt::Display for SockAddr {
             SockAddr::Unix(ref unix) => unix.fmt(f),
             #[cfg(any(target_os = "android", target_os = "linux"))]
             SockAddr::Netlink(ref nl) => nl.fmt(f),
+            #[cfg(any(target_os = "android", target_os = "linux"))]
+            SockAddr::Packet(ref p) => p.fmt(f),
             #[cfg(any(target_os = "ios", target_os = "macos"))]
             SockAddr::SysControl(ref sc) => sc.fmt(f),
         }
@@ -873,6 +892,54 @@ pub mod netlink {
     impl fmt::Display for NetlinkAddr {
         fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
             write!(f, "pid: {} groups: {}", self.pid(), self.groups())
+        }
+    }
+}
+
+#[cfg(any(target_os = "android", target_os = "linux"))]
+pub mod packet {
+    use libc::{self, sa_family_t, sockaddr_ll};
+    use std::{fmt, mem};
+    use std::hash::{Hash, Hasher};
+
+    #[derive(Copy, Clone)]
+    pub struct PacketAddr(pub sockaddr_ll);
+
+    impl PartialEq for PacketAddr {
+        fn eq(&self, other_pa: &Self) -> bool {
+            let (inner, other) = (self.0, other_pa.0);
+            assert!(inner.sll_family == libc::AF_PACKET as sa_family_t);
+            assert!((inner.sll_halen as usize) < mem::size_of_val(&inner.sll_addr));
+            assert!(other.sll_family == libc::AF_PACKET as sa_family_t);
+            assert!((other.sll_halen as usize) < mem::size_of_val(&other.sll_addr));
+            (inner.sll_family, inner.sll_protocol, inner.sll_ifindex, inner.sll_hatype,
+             inner.sll_pkttype, self.get_addr()) ==
+            (other.sll_family, other.sll_protocol, other.sll_ifindex, other.sll_hatype,
+             other.sll_pkttype, other_pa.get_addr())
+        }
+    }
+
+    impl Eq for PacketAddr {}
+
+    impl Hash for PacketAddr {
+        fn hash<H: Hasher>(&self, s: &mut H) {
+            let inner = self.0;
+            (inner.sll_family, inner.sll_protocol, inner.sll_ifindex, inner.sll_hatype,
+                inner.sll_pkttype, self.get_addr()).hash(s);
+        }
+    }
+
+    impl PacketAddr {
+        pub fn get_addr<'a>(&'a self) -> &'a [u8] {
+            &self.0.sll_addr[..(self.0.sll_halen as usize)]
+        }
+    }
+
+    impl fmt::Display for PacketAddr {
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            let inner = self.0;
+            write!(f, "protocol: {} ifindex: {} hatype: {} halen: {}",
+                inner.sll_protocol, inner.sll_ifindex, inner.sll_hatype, inner.sll_halen)
         }
     }
 }
